@@ -185,6 +185,36 @@ class TestValidateStructuredStockList:
 # ---------------------------------------------------------------------------
 
 class TestValidateStructuredLLM:
+    def test_unknown_generation_backend_is_structured_config_error(self):
+        cfg = _make_config(generation_backend="codex")
+
+        issues = cfg.validate_structured()
+
+        error = next(i for i in issues if i.field == "GENERATION_BACKEND")
+        assert error.severity == "error"
+        assert "仅支持 litellm" in error.message
+        assert "codex" in error.message
+
+    def test_unknown_generation_fallback_backend_is_structured_config_error(self):
+        cfg = _make_config(generation_fallback_backend="claude_code")
+
+        issues = cfg.validate_structured()
+
+        error = next(i for i in issues if i.field == "GENERATION_FALLBACK_BACKEND")
+        assert error.severity == "error"
+        assert "仅支持 litellm" in error.message
+        assert "claude_code" in error.message
+
+    def test_unknown_agent_generation_backend_is_structured_config_error(self):
+        cfg = _make_config(agent_generation_backend="hermes")
+
+        issues = cfg.validate_structured()
+
+        error = next(i for i in issues if i.field == "AGENT_GENERATION_BACKEND")
+        assert error.severity == "error"
+        assert "仅支持 auto 或 litellm" in error.message
+        assert "hermes" in error.message
+
     def test_no_llm_is_error(self):
         """Empty llm_model_list must produce an error regardless of legacy keys."""
         cfg = _make_config(llm_model_list=[])
@@ -517,6 +547,19 @@ class TestValidateStructuredNotification:
             feishu_app_id="cli_xxx",
             feishu_app_secret="secret_xxx",
             feishu_folder_token="folder_xxx",
+            feishu_webhook_url=None,
+            feishu_stream_enabled=False,
+        )
+        issues = cfg.validate_structured()
+        warn = [i for i in issues if i.severity == "warning"]
+        assert not any("FEISHU_APP_ID / FEISHU_APP_SECRET" in i.message for i in warn)
+
+    def test_feishu_app_bot_triad_without_webhook_no_mode_warning(self):
+        cfg = _make_config(
+            wechat_webhook_url=None,
+            feishu_app_id="cli_xxx",
+            feishu_app_secret="secret_xxx",
+            feishu_chat_id="oc_xxx",
             feishu_webhook_url=None,
             feishu_stream_enabled=False,
         )

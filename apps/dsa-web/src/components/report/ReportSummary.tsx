@@ -6,6 +6,7 @@ import { ReportNews } from './ReportNews';
 import { ReportDetails } from './ReportDetails';
 import { ReportDiagnostics } from './ReportDiagnostics';
 import { AnalysisContextSummary } from './AnalysisContextSummary';
+import { MarketReviewReportView } from './MarketReviewReportView';
 import { getReportText, normalizeReportLanguage } from '../../utils/reportLanguage';
 
 interface ReportSummaryProps {
@@ -18,6 +19,7 @@ interface ReportSummaryProps {
     isActioning: boolean;
     actionMessage: string | null;
   };
+  onOpenRunFlow?: (recordId: number) => void;
 }
 
 /**
@@ -28,6 +30,7 @@ export const ReportSummary: React.FC<ReportSummaryProps> = ({
   data,
   isHistory = false,
   watchlist,
+  onOpenRunFlow,
 }) => {
   // 兼容 AnalysisResult 和 AnalysisReport 两种数据格式
   const report: AnalysisReport = 'report' in data ? data.report : data;
@@ -42,6 +45,17 @@ export const ReportSummary: React.FC<ReportSummaryProps> = ({
   const shouldShowModel = Boolean(
     modelUsed && !['unknown', 'error', 'none', 'null', 'n/a'].includes(modelUsed.toLowerCase()),
   );
+
+  if (meta.reportType === 'market_review') {
+    return (
+      <MarketReviewReportView
+        report={report}
+        recordId={recordId}
+        reportLanguage={reportLanguage}
+        onOpenRunFlow={onOpenRunFlow}
+      />
+    );
+  }
 
   return (
     <div className="space-y-5 pb-8 animate-fade-in">
@@ -71,6 +85,7 @@ export const ReportSummary: React.FC<ReportSummaryProps> = ({
         recordId={recordId}
         summary={diagnosticSummary}
         language={reportLanguage}
+        onOpenRunFlow={onOpenRunFlow}
       />
 
       {/* 透明度与追溯区 */}

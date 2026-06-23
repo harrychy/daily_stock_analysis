@@ -27,6 +27,7 @@ from src.agent.llm_adapter import (
     resolve_fallback_litellm_wire_models,
     register_fallback_model_pricing,
 )
+from src.agent.provider_trace import resolved_model_provider_identity
 from src.agent.skills.defaults import CORE_TRADING_SKILL_POLICY_ZH
 from src.config import (
     Config,
@@ -40,6 +41,24 @@ from src.config import (
 )
 from src.llm.generation_params import apply_litellm_generation_params
 from src.llm.errors import call_litellm_with_param_recovery
+from src.llm.backend_registry import (
+    LITELLM_BACKEND_ID,
+    resolve_generation_backend_id,
+    resolve_generation_fallback_backend_id,
+)
+from src.llm.generation_backend import GenerationError, GenerationErrorCode
+from src.llm.litellm_backend import LiteLLMGenerationBackend
+from src.llm.usage import (
+    attach_legacy_message_stability_audit,
+    attach_message_hmacs,
+    extract_usage_payload,
+    normalize_litellm_usage,
+)
+from src.llm.provider_cache import (
+    apply_prompt_cache_hints,
+    build_provider_cache_route_context,
+    filter_prompt_cache_telemetry,
+)
 from src.storage import persist_llm_usage
 from src.data.stock_mapping import STOCK_NAME_MAP
 from src.report_language import (
@@ -54,8 +73,10 @@ from src.report_language import (
     localize_confidence_level,
     normalize_report_language,
 )
+from src.schemas.decision_action import build_action_fields
 from src.schemas.report_schema import AnalysisReportSchema
-from src.market_context import get_market_role, get_market_guidelines
+from src.market_context import detect_market, get_market_role, get_market_guidelines
+from src.services.daily_market_context import format_daily_market_context_prompt_section
 from src.market_phase_prompt import format_market_phase_prompt_section
 
 logger = logging.getLogger(__name__)
@@ -154,6 +175,50 @@ def _should_hide_regular_session_ohlc(context: Dict[str, Any]) -> bool:
         context,
         phase_context,
     )
+
+
+def _legacy_market_group(stock_code: Any) -> str:
+    code = str(stock_code or "").strip()
+    if not code or code.lower() == "unknown":
+        return "unknown"
+    market = detect_market(code)
+    return market if market in {"cn", "hk", "us"} else "unknown"
+
+
+def _legacy_audit_marker_specs(
+    context: Dict[str, Any],
+    *,
+    code: str,
+    stock_name: str,
+    report_language: str,
+    news_context: Optional[str],
+    analysis_context_pack_summary: Optional[str],
+) -> List[Dict[str, Any]]:
+    markers: List[Dict[str, Any]] = []
+
+    def add(marker_name: str, value: Any) -> None:
+        if value is None:
+            return
+        text = str(value).strip()
+        if not text:
+            return
+        markers.append(
+            {
+                "marker_name": marker_name,
+                "message_role": "user",
+                "text": text,
+            }
+        )
+
+    add("stock_code", code)
+    add("stock_name", stock_name)
+    add("analysis_date", context.get("date"))
+    add("market_phase", "## Market Phase Context" if report_language == "en" else "## 市场阶段上下文")
+    add("daily_market_context", "## Daily Market Context" if report_language == "en" else "## 大盘环境摘要")
+    add("analysis_context_pack", analysis_context_pack_summary)
+    add("quote", "## 📈 技术面数据")
+    add("news_context", "## 📰 舆情情报" if news_context else None)
+    return markers
 
 
 class _LiteLLMStreamError(RuntimeError):
@@ -1690,6 +1755,8 @@ class AnalysisResult:
     decision_type: str = "hold"  # 决策类型：buy/hold/sell（用于统计）
     confidence_level: str = "中"  # 置信度：高/中/低
     report_language: str = "zh"  # 报告输出语言：zh/en
+    action: Optional[str] = None  # 建议动作 taxonomy：buy/add/hold/reduce/sell/watch/avoid/alert
+    action_label: Optional[str] = None  # 本地化建议动作标签
 
     # ========== 决策仪表盘 (新增) ==========
     dashboard: Optional[Dict[str, Any]] = None  # 完整的决策仪表盘数据
@@ -1753,6 +1820,8 @@ class AnalysisResult:
             'decision_type': self.decision_type,
             'confidence_level': self.confidence_level,
             'report_language': self.report_language,
+            'action': self.action,
+            'action_label': self.action_label,
             'dashboard': self.dashboard,  # 决策仪表盘数据
             'trend_analysis': self.trend_analysis,
             'short_term_outlook': self.short_term_outlook,
@@ -1833,6 +1902,30 @@ class AnalysisResult:
             "low": "⭐",
         }
         return star_map.get(str(self.confidence_level or "").strip().lower(), "⭐⭐")
+
+
+def populate_decision_action_fields(
+    result: AnalysisResult,
+    *,
+    explicit_action: Any = None,
+    report_type: Any = None,
+    use_existing_action: bool = True,
+) -> AnalysisResult:
+    """Populate optional decision action fields without changing legacy advice."""
+
+    action_source = explicit_action
+    if action_source is None and use_existing_action:
+        action_source = getattr(result, "action", None)
+
+    fields = build_action_fields(
+        operation_advice=getattr(result, "operation_advice", None),
+        explicit_action=action_source,
+        report_type=report_type,
+        report_language=getattr(result, "report_language", "zh"),
+    )
+    result.action = fields["action"]
+    result.action_label = fields["action_label"]
+    return result
 
 
 class GeminiAnalyzer:
@@ -2444,8 +2537,33 @@ class GeminiAnalyzer:
             )
 
     def is_available(self) -> bool:
-        """Check if LiteLLM is properly configured with at least one API key."""
+        """Check whether the configured generation backend is available."""
+        if self.get_generation_backend_config_error() is not None:
+            return False
         return self._router is not None or self._litellm_available
+
+    def _resolve_generation_backend_config(self) -> Tuple[str, Optional[str]]:
+        """Resolve and validate Phase 1 generation backend settings."""
+        config = self._get_runtime_config()
+        backend_id = resolve_generation_backend_id(config)
+        fallback_backend_id = resolve_generation_fallback_backend_id(config)
+        if backend_id != LITELLM_BACKEND_ID:
+            raise GenerationError(
+                error_code=GenerationErrorCode.CAPABILITY_UNSUPPORTED,
+                stage="generation",
+                retryable=False,
+                fallbackable=False,
+                backend=backend_id,
+            )
+        return backend_id, fallback_backend_id
+
+    def get_generation_backend_config_error(self) -> Optional[GenerationError]:
+        """Return a structured backend config error, if Phase 1 cannot run it."""
+        try:
+            self._resolve_generation_backend_config()
+        except GenerationError as exc:
+            return exc
+        return None
 
     def _dispatch_litellm_completion(
         self,
@@ -2471,21 +2589,22 @@ class GeminiAnalyzer:
         effective_kwargs.update(extra_litellm_params(model, config))
         return litellm.completion(**effective_kwargs)
 
-    def _normalize_usage(self, usage_obj: Any) -> Dict[str, Any]:
+    def _normalize_usage(
+        self,
+        usage_obj: Any,
+        *,
+        model: str = "",
+        provider: Optional[str] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
         """Normalize usage objects from LiteLLM responses/chunks."""
         if not usage_obj:
-            return {}
-
-        def _get_value(key: str) -> int:
-            if isinstance(usage_obj, dict):
-                return int(usage_obj.get(key) or 0)
-            return int(getattr(usage_obj, key, 0) or 0)
-
-        return {
-            "prompt_tokens": _get_value("prompt_tokens"),
-            "completion_tokens": _get_value("completion_tokens"),
-            "total_tokens": _get_value("total_tokens"),
-        }
+            usage = attach_message_hmacs({}, messages) if messages is not None else {}
+            return filter_prompt_cache_telemetry(usage, self._get_runtime_config())
+        usage = normalize_litellm_usage(usage_obj, model=model, provider=provider)
+        if messages is not None:
+            usage = attach_message_hmacs(usage, messages)
+        return filter_prompt_cache_telemetry(usage, self._get_runtime_config())
 
     @staticmethod
     def _get_response_field(obj: Any, key: str) -> Any:
@@ -2590,6 +2709,8 @@ class GeminiAnalyzer:
         stream_response: Any,
         *,
         model: str,
+        usage_model: Optional[str] = None,
+        provider: Optional[str] = None,
         progress_callback: Optional[Callable[[int], None]] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """Consume a LiteLLM stream into a single text payload."""
@@ -2600,8 +2721,12 @@ class GeminiAnalyzer:
 
         try:
             for chunk in stream_response:
-                chunk_usage = chunk.get("usage") if isinstance(chunk, dict) else getattr(chunk, "usage", None)
-                normalized_usage = self._normalize_usage(chunk_usage)
+                chunk_usage = extract_usage_payload(chunk)
+                normalized_usage = self._normalize_usage(
+                    chunk_usage,
+                    model=usage_model or model,
+                    provider=provider,
+                )
                 if normalized_usage:
                     usage = normalized_usage
 
@@ -2632,6 +2757,11 @@ class GeminiAnalyzer:
 
         return response_text, usage
 
+    def _get_generation_backend(self) -> LiteLLMGenerationBackend:
+        """Return the configured Phase 1 generation backend."""
+        self._resolve_generation_backend_config()
+        return LiteLLMGenerationBackend(self._call_litellm_impl)
+
     def _call_litellm(
         self,
         prompt: str,
@@ -2641,6 +2771,30 @@ class GeminiAnalyzer:
         stream: bool = False,
         stream_progress_callback: Optional[Callable[[int], None]] = None,
         response_validator: Optional[Callable[[str], None]] = None,
+        audit_context: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, str, Dict[str, Any]]:
+        """Compatibility wrapper around the configured generation backend."""
+        result = self._get_generation_backend().generate(
+            prompt,
+            generation_config,
+            system_prompt=system_prompt,
+            stream=stream,
+            stream_progress_callback=stream_progress_callback,
+            response_validator=response_validator,
+            audit_context=audit_context,
+        )
+        return result.text, result.model, result.usage
+
+    def _call_litellm_impl(
+        self,
+        prompt: str,
+        generation_config: dict,
+        *,
+        system_prompt: Optional[str] = None,
+        stream: bool = False,
+        stream_progress_callback: Optional[Callable[[int], None]] = None,
+        response_validator: Optional[Callable[[str], None]] = None,
+        audit_context: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, str, Dict[str, Any]]:
         """Call LLM via litellm with fallback across configured models.
 
@@ -2686,8 +2840,32 @@ class GeminiAnalyzer:
             legacy_router_model_list = getattr(self, "_legacy_router_model_list", None) or []
             if legacy_router_model_list and model == config.litellm_model and not use_channel_router:
                 recovery_model_list = legacy_router_model_list
+            usage_model, usage_provider = resolved_model_provider_identity(model, recovery_model_list)
 
             try:
+                def _attach_usage_audit(
+                    usage: Dict[str, Any],
+                    messages: List[Dict[str, Any]],
+                ) -> Dict[str, Any]:
+                    if audit_context is None:
+                        return filter_prompt_cache_telemetry(
+                            attach_message_hmacs(usage, messages),
+                            config,
+                        )
+                    effective_audit_context = dict(audit_context)
+                    effective_audit_context["provider"] = usage_provider
+                    effective_audit_context["transport"] = (
+                        effective_audit_context.get("transport") or "litellm"
+                    )
+                    return filter_prompt_cache_telemetry(
+                        attach_legacy_message_stability_audit(
+                            usage,
+                            messages,
+                            effective_audit_context,
+                        ),
+                        config,
+                    )
+
                 model_short = model.split("/")[-1] if "/" in model else model
                 extra = get_thinking_extra_body(model_short)
                 call_kwargs: Dict[str, Any] = {
@@ -2721,6 +2899,17 @@ class GeminiAnalyzer:
                     requested_temperature,
                     model_list=recovery_model_list,
                 )
+                route_context = build_provider_cache_route_context(
+                    model=model,
+                    provider=usage_provider,
+                    call_kwargs=call_kwargs,
+                    model_list=recovery_model_list,
+                    call_type="analysis",
+                )
+                hint_result = apply_prompt_cache_hints(call_kwargs, route_context, config)
+                call_kwargs = hint_result.call_kwargs
+                if hint_result.diagnostics:
+                    logger.debug("[PromptCache] %s", hint_result.diagnostics)
 
                 _stream_text: Optional[str] = None
                 _stream_usage: Dict[str, Any] = {}
@@ -2744,6 +2933,8 @@ class GeminiAnalyzer:
                         _stream_text, _stream_usage = self._consume_litellm_stream(
                             stream_response,
                             model=model,
+                            usage_model=usage_model,
+                            provider=usage_provider,
                             progress_callback=stream_progress_callback,
                         )
                     except _LiteLLMStreamError as exc:
@@ -2770,6 +2961,7 @@ class GeminiAnalyzer:
                 if _stream_text is not None:
                     last_response_text = _stream_text
                     last_model = model
+                    _stream_usage = _attach_usage_audit(_stream_usage, call_kwargs["messages"])
                     last_usage = _stream_usage
                     if response_validator is not None:
                         response_validator(_stream_text)
@@ -2791,7 +2983,15 @@ class GeminiAnalyzer:
 
                 content = self._extract_completion_text(response)
                 if content:
-                    usage = self._normalize_usage(self._get_response_field(response, "usage"))
+                    usage_messages = None if audit_context is not None else call_kwargs["messages"]
+                    usage = self._normalize_usage(
+                        extract_usage_payload(response),
+                        model=usage_model or model,
+                        provider=usage_provider,
+                        messages=usage_messages,
+                    )
+                    if audit_context is not None:
+                        usage = _attach_usage_audit(usage, call_kwargs["messages"])
                     last_response_text = content
                     last_model = model
                     last_usage = usage
@@ -2842,6 +3042,8 @@ class GeminiAnalyzer:
                 persist_llm_usage(usage, model_used, call_type="market_review")
                 return text
             return result
+        except GenerationError:
+            raise
         except Exception as exc:
             logger.error("[generate_text] LLM call failed: %s", exc)
             return None
@@ -2882,6 +3084,7 @@ class GeminiAnalyzer:
         config = self._get_runtime_config()
         report_language = normalize_report_language(getattr(config, "report_language", "zh"))
         system_prompt = self._get_analysis_system_prompt(report_language, stock_code=code)
+        skill_instructions, default_skill_policy, use_legacy_default_prompt = self._get_skill_prompt_sections()
         
         # 请求前增加延时（防止连续请求触发限流）
         request_delay = config.gemini_request_delay
@@ -2899,7 +3102,46 @@ class GeminiAnalyzer:
             else:
                 # 最后从映射表获取
                 name = STOCK_NAME_MAP.get(code, f'股票{code}')
-        
+
+        backend_error = self.get_generation_backend_config_error()
+        if backend_error is not None:
+            details = backend_error.details or {}
+            field = str(details.get("field") or "GENERATION_BACKEND")
+            requested_backend = str(details.get("requested_backend") or backend_error.backend)
+            if report_language == "en":
+                summary = (
+                    "AI analysis is unavailable because the generation backend "
+                    f"configuration is invalid: {field}={requested_backend}."
+                )
+                risk_warning = (
+                    f"Phase 1 only supports litellm for {field}; set it back to "
+                    "litellm and retry."
+                )
+            else:
+                summary = (
+                    "AI 分析功能不可用：生成后端配置错误，"
+                    f"{field}={requested_backend}。"
+                )
+                risk_warning = (
+                    f"Phase 1 中 {field} 仅支持 litellm；请设回 litellm 后重试。"
+                )
+            return AnalysisResult(
+                code=code,
+                name=name,
+                sentiment_score=50,
+                trend_prediction='Sideways' if report_language == "en" else '震荡',
+                operation_advice='Hold' if report_language == "en" else '持有',
+                confidence_level='Low' if report_language == "en" else '低',
+                analysis_summary=summary,
+                risk_warning=risk_warning,
+                success=False,
+                error_message=(
+                    f"{backend_error.error_code.value}: {field}={requested_backend}"
+                ),
+                model_used=None,
+                report_language=report_language,
+            )
+
         # 如果模型不可用，返回默认结果
         if not self.is_available():
             return AnalysisResult(
@@ -2926,6 +3168,26 @@ class GeminiAnalyzer:
                 report_language=report_language,
                 analysis_context_pack_summary=analysis_context_pack_summary,
             )
+            legacy_audit_context = {
+                "language": report_language,
+                "market_group": _legacy_market_group(code),
+                "analysis_mode": "stock_analysis",
+                "legacy_prompt_mode": "legacy_default" if use_legacy_default_prompt else "skill_aware",
+                "skill_config": {
+                    "skill_instructions": skill_instructions,
+                    "default_skill_policy": default_skill_policy,
+                    "use_legacy_default_prompt": use_legacy_default_prompt,
+                },
+                "transport": "litellm",
+                "dynamic_markers": _legacy_audit_marker_specs(
+                    context,
+                    code=code,
+                    stock_name=name,
+                    report_language=report_language,
+                    news_context=news_context,
+                    analysis_context_pack_summary=analysis_context_pack_summary,
+                ),
+            }
             
             config = self._get_runtime_config()
             model_name = config.litellm_model or "unknown"
@@ -2963,6 +3225,7 @@ class GeminiAnalyzer:
                         stream=True,
                         stream_progress_callback=stream_progress_callback,
                         response_validator=self._validate_json_response,
+                        audit_context=legacy_audit_context,
                     )
                 except _AllModelsFailedError as exc:
                     if exc.last_response_text is not None:
@@ -3131,6 +3394,12 @@ class GeminiAnalyzer:
             context.get("market_phase_context"),
             report_language=report_language,
         )
+        daily_market_context_section = format_daily_market_context_prompt_section(
+            context.get("daily_market_context"),
+            report_language=report_language,
+        )
+        if daily_market_context_section:
+            prompt += daily_market_context_section
         if isinstance(analysis_context_pack_summary, str) and analysis_context_pack_summary:
             prompt += analysis_context_pack_summary
         prompt += f"""
@@ -3762,7 +4031,11 @@ class GeminiAnalyzer:
                     op = data.get('operation_advice', 'Hold' if report_language == "en" else '持有')
                     decision_type = infer_decision_type_from_advice(op, default='hold')
                 
-                return AnalysisResult(
+                explicit_action = data.get("action")
+                if explicit_action is None and isinstance(dashboard, dict):
+                    explicit_action = dashboard.get("action")
+
+                result = AnalysisResult(
                     code=code,
                     name=name,
                     # 核心指标
@@ -3804,6 +4077,7 @@ class GeminiAnalyzer:
                     data_sources=data.get('data_sources', 'Technical data' if report_language == "en" else '技术面数据'),
                     success=True,
                 )
+                return populate_decision_action_fields(result, explicit_action=explicit_action)
             else:
                 # 没有找到 JSON，标记为失败
                 logger.warning(f"无法从响应中提取 JSON，标记为解析失败")
@@ -3901,7 +4175,7 @@ class GeminiAnalyzer:
         # 截取前500字符作为摘要
         summary = response_text[:500] if response_text else ('No analysis result' if report_language == "en" else '无分析结果')
         
-        return AnalysisResult(
+        result = AnalysisResult(
             code=code,
             name=name,
             sentiment_score=sentiment_score,
@@ -3917,6 +4191,7 @@ class GeminiAnalyzer:
             error_message='LLM response is not valid JSON; analysis result will not be persisted',
             report_language=report_language,
         )
+        return populate_decision_action_fields(result)
     
     def batch_analyze(
         self, 
