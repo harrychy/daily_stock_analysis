@@ -519,6 +519,40 @@ class LLMChannelConfigTestCase(unittest.TestCase):
             0.6,
         )
 
+    def test_sap_aicore_opus_omits_temperature(self) -> None:
+        """SAP AI Core gateway rejects temperature for the 'anthropic--*-opus*' alias.
+
+        Anthropic's own API accepts temperature for Opus, so we only target the
+        SAP namespace ('anthropic--' double-dash prefix) and leave Sonnet alone.
+        """
+        directive = resolve_litellm_temperature_directive(
+            "openai/anthropic--claude-opus-latest"
+        )
+        self.assertTrue(directive.omit_temperature)
+
+        call_kwargs = apply_litellm_generation_params(
+            {
+                "model": "openai/anthropic--claude-opus-latest",
+                "messages": [],
+                "temperature": 0.7,
+            },
+            "openai/anthropic--claude-opus-latest",
+            0.7,
+        )
+        self.assertNotIn("temperature", call_kwargs)
+
+        # Sonnet on the same SAP namespace is NOT affected.
+        sonnet_directive = resolve_litellm_temperature_directive(
+            "openai/anthropic--claude-sonnet-latest"
+        )
+        self.assertFalse(sonnet_directive.omit_temperature)
+
+        # Anthropic's own (non-SAP) Opus alias is NOT affected either.
+        official_opus_directive = resolve_litellm_temperature_directive(
+            "anthropic/claude-opus-4-7"
+        )
+        self.assertFalse(official_opus_directive.omit_temperature)
+
     def test_gpt5_family_temperature_is_omitted_at_request_build_time(self) -> None:
         directive = resolve_litellm_temperature_directive("openai/gpt5.5-ferr")
         self.assertTrue(directive.omit_temperature)

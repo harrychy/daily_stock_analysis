@@ -3582,3 +3582,158 @@ class StockAnalysisPipeline:
         if report_type == ReportType.BRIEF and hasattr(self.notifier, "generate_brief_report"):
             return self.notifier.generate_brief_report(results)
         return self.notifier.generate_dashboard_report(results)
+
+    # ============================================================
+    # 两阶段筛选 - 第一阶段：技术面预筛（独立路径，不复用 dry_run 标志）
+    # ============================================================
+
+    def run_technical_screening(
+        self,
+        stock_codes: List[str],
+        *,
+        on_score: Optional[Callable[["ScreeningResult"], None]] = None,
+        current_time: Optional[datetime] = None,
+    ) -> List["ScreeningResult"]:
+        """
+        对一批股票仅跑技术面分析（不调 LLM、不写 AnalysisHistory、不发通知）。
+
+        设计目的（参见 docs/two-stage-screening.md）：
+        - 第一阶段批量扫描，便宜快速
+        - 每只股票 fetch+analyze 完成立刻调 on_score 回调（驱动 SSE 流）
+        - 复用 fetch_and_save_stock_data + trend_analyzer.analyze（pipeline.py:413 现有路径）
+
+        Args:
+            stock_codes: 股票代码列表
+            on_score: 单只股票完成后的回调，用于推 SSE 事件；可为 None
+            current_time: 本轮冻结时间（与 run() 语义一致）
+
+        Returns: 完整 ScreeningResult 列表（顺序与输入一致；按 signal_score 排序由调用方做）
+        """
+        from src.core.screening import ScreeningResult
+
+        # 去重 + 标准化
+        normalized_codes: List[str] = []
+        seen = set()
+        for raw in stock_codes:
+            code = normalize_stock_code((raw or "").strip())
+            if code and code not in seen:
+                seen.add(code)
+                normalized_codes.append(code)
+
+        if not normalized_codes:
+            return []
+
+        logger.info(
+            "[筛选] 开始技术面预筛: %d 只股票（并发=%d）",
+            len(normalized_codes),
+            max(1, self.config.max_workers),
+        )
+
+        # 批量预取实时报价（>=5 只时仓库已有的优化路径会触发缓存）
+        try:
+            self.fetcher_manager.prefetch_realtime_quotes(normalized_codes)
+        except Exception as exc:
+            logger.debug("[筛选] prefetch_realtime_quotes 失败（可忽略）: %s", exc)
+
+        # 并发跑单只技术面，限速 = max_workers，独立于 task_queue worker
+        results: Dict[str, ScreeningResult] = {}
+
+        def _screen_single(code: str) -> "ScreeningResult":
+            return self._screen_one_stock(code, current_time=current_time)
+
+        with ThreadPoolExecutor(max_workers=max(1, self.config.max_workers)) as pool:
+            future_to_code = {pool.submit(_screen_single, c): c for c in normalized_codes}
+            for fut in as_completed(future_to_code):
+                code = future_to_code[fut]
+                try:
+                    result = fut.result()
+                except Exception as exc:
+                    result = ScreeningResult(code=code, error_msg=f"unexpected: {exc}")
+                    logger.warning("[筛选] %s 意外失败: %s", code, exc)
+                results[code] = result
+                if on_score is not None:
+                    try:
+                        on_score(result)
+                    except Exception as cb_exc:
+                        logger.warning("[筛选] on_score 回调异常: %s", cb_exc)
+
+        # 保持输入顺序返回
+        ordered = [results[c] for c in normalized_codes if c in results]
+        success = sum(1 for r in ordered if r.is_success())
+        logger.info(
+            "[筛选] 技术面预筛完成: 成功=%d, 失败=%d, 总计=%d",
+            success,
+            len(ordered) - success,
+            len(ordered),
+        )
+        return ordered
+
+    def _screen_one_stock(
+        self,
+        code: str,
+        *,
+        current_time: Optional[datetime] = None,
+    ) -> "ScreeningResult":
+        """单只股票的技术面流程：fetch + 趋势分析（不含 LLM）。"""
+        from src.core.screening import ScreeningResult
+        from src.services.history_loader import get_frozen_target_date
+
+        try:
+            # Step 1: 获取并保存日线（断点续传：已有则跳过网络）
+            ok, err = self.fetch_and_save_stock_data(
+                code, force_refresh=False, current_time=current_time
+            )
+            if not ok:
+                return ScreeningResult(code=code, error_msg=err or "fetch_failed")
+
+            stock_name = self.fetcher_manager.get_stock_name(code, allow_realtime=False) or code
+
+            # Step 2: 取实时报价（可空，失败不影响打分）
+            realtime_quote = None
+            try:
+                if self.config.enable_realtime_quote:
+                    realtime_quote = self.fetcher_manager.get_realtime_quote(
+                        code, log_final_failure=False
+                    )
+            except Exception:
+                realtime_quote = None
+
+            # Step 3: 加载历史 K 线 + 趋势分析（复用 pipeline.py:413 同款逻辑）
+            _mkt = get_market_for_stock(normalize_stock_code(code))
+            frozen = get_frozen_target_date()
+            end_date = frozen if frozen else get_market_now(_mkt).date()
+            start_date = end_date - timedelta(days=89)
+            historical_bars = self.db.get_data_range(code, start_date, end_date)
+            if not historical_bars:
+                return ScreeningResult(
+                    code=code,
+                    name=stock_name,
+                    error_msg="no_historical_data",
+                )
+
+            df = pd.DataFrame([bar.to_dict() for bar in historical_bars])
+            if self.config.enable_realtime_quote and realtime_quote:
+                df = self._augment_historical_with_realtime(df, realtime_quote, code)
+
+            trend_result = self.trend_analyzer.analyze(df, code)
+            if trend_result is None:
+                return ScreeningResult(
+                    code=code,
+                    name=stock_name,
+                    error_msg="trend_analyze_returned_none",
+                )
+
+            return ScreeningResult(
+                code=code,
+                name=stock_name,
+                signal_score=int(trend_result.signal_score or 0),
+                trend_strength=float(trend_result.trend_strength or 0.0),
+                trend_status=trend_result.trend_status.value if hasattr(trend_result.trend_status, "value") else str(trend_result.trend_status),
+                buy_signal=trend_result.buy_signal.value if hasattr(trend_result.buy_signal, "value") else str(trend_result.buy_signal),
+                ma_alignment=trend_result.ma_alignment or "",
+                current_price=getattr(realtime_quote, "price", None) if realtime_quote else None,
+                volume_ratio=getattr(realtime_quote, "volume_ratio", None) if realtime_quote else None,
+            )
+        except Exception as exc:
+            logger.warning("[筛选] %s 单只技术面分析失败: %s", code, exc, exc_info=True)
+            return ScreeningResult(code=code, error_msg=f"exception: {exc}")

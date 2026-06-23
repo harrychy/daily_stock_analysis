@@ -186,13 +186,28 @@ def _matches_model_family(model: str, family: str) -> bool:
 
 
 def _should_omit_litellm_temperature(model: str) -> bool:
-    """Return whether a model family should rely on the provider default temperature."""
-    return any(
+    """Return whether a model family should rely on the provider default temperature.
+
+    Covers two cases:
+    - OpenAI 'gpt-5' / 'o1' / 'o3' / 'o4' families which reject custom temperatures.
+    - SAP AI Core's Anthropic Claude Opus tier (model id begins with
+      'anthropic--' and includes 'opus'); SAP gateway returns
+      ``temperature is deprecated for this model`` for these aliases even
+      though Anthropic's own API accepts temperature.
+    """
+    parts = _model_parts(model)
+    if any(
         part.startswith(("gpt-5", "gpt5"))
         or part in {"o1", "o3", "o4"}
         or part.startswith(("o1-", "o3-", "o4-"))
-        for part in _model_parts(model)
-    )
+        for part in parts
+    ):
+        return True
+    # SAP AI Core uses the 'anthropic--<model>' namespace; only Opus is
+    # impacted, Sonnet/Haiku still accept temperature.
+    if any(part.startswith("anthropic--") and "opus" in part for part in parts):
+        return True
+    return False
 
 
 def get_fixed_litellm_temperature(
