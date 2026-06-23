@@ -2133,7 +2133,15 @@ class DataFetcherManager:
                 circuit_breaker.record_failure(source_key, str(e))
                 continue
 
-        logger.warning(f"[筹码分布] {stock_code} 所有数据源均失败")
+        # 美股 / 港股 没有日级筹码分布概念（这是 A 股龙虎榜 + 机构席位衍生数据）。
+        # 数据源全部"失败"是设计如此，降级为 INFO 并改文案，避免用户误认为坏了。
+        if _is_us_market(stock_code) or _is_hk_market(stock_code):
+            logger.info(
+                "[筹码分布] %s 该市场不支持日级筹码分布，跳过（A 股特有数据）",
+                stock_code,
+            )
+        else:
+            logger.warning(f"[筹码分布] {stock_code} 所有数据源均失败")
         return None
 
     def get_stock_name(self, stock_code: str, allow_realtime: bool = True) -> Optional[str]:

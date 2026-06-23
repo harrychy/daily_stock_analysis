@@ -362,6 +362,63 @@ class AnalysisHistory(Base):
         }
 
 
+class TechnicalScreeningHistory(Base):
+    """
+    两阶段筛选 - 第一阶段技术面预筛历史记录
+
+    每次"两阶段筛选"启动时，会为该批次生成一个 screening_id；
+    批次内每只股票的技术面评分（来自 src/stock_analyzer.py 的死规则）
+    各落一行。第二阶段 promote 时按 signal_score desc 取 Top N。
+    """
+    __tablename__ = 'technical_screening_history'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    # 批次 ID（同一次筛选共享）
+    screening_id = Column(String(64), nullable=False, index=True)
+
+    # 股票信息
+    code = Column(String(10), nullable=False, index=True)
+    name = Column(String(50))
+
+    # 技术面分数（关键字段，用于 Top N 排序）
+    signal_score = Column(Integer, default=0)
+    trend_strength = Column(Float, default=0.0)
+    trend_status = Column(String(50))
+    buy_signal = Column(String(20))
+    ma_alignment = Column(String(100))
+
+    # 实时报价快照（来自 fetcher_manager；可空）
+    current_price = Column(Float)
+    volume_ratio = Column(Float)
+
+    # 失败原因（fetch 失败 / 数据不足 / 计算异常）；成功时为空
+    error_msg = Column(Text)
+
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_tech_screen_code_time', 'code', 'created_at'),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'id': self.id,
+            'screening_id': self.screening_id,
+            'code': self.code,
+            'name': self.name,
+            'signal_score': self.signal_score,
+            'trend_strength': self.trend_strength,
+            'trend_status': self.trend_status,
+            'buy_signal': self.buy_signal,
+            'ma_alignment': self.ma_alignment,
+            'current_price': self.current_price,
+            'volume_ratio': self.volume_ratio,
+            'error_msg': self.error_msg,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 class BacktestResult(Base):
     """单条分析记录的回测结果。"""
 
