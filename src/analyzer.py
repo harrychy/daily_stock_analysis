@@ -733,6 +733,191 @@ def _filter_conflicting_trend_items(items: List[str], conflict_hints: Tuple[str,
     return [item for item in items if not _contains_trend_hint(item, conflict_hints)]
 
 
+# ---------------------------------------------------------------------------
+# 扩展技术指标 prompt 注入
+# ---------------------------------------------------------------------------
+
+_EXTENDED_DISCLAIMER = (
+    "\n> 上述扩展指标供综合判断参考，不替代主表的趋势/乖离率/系统评分。"
+    "\n> 同向多指标共振时增强信心；冲突时优先以趋势状态为准并写明矛盾点。\n"
+)
+
+
+def _format_extended_indicators_section(
+    ext: Any,
+    *,
+    report_language: str = "zh",
+) -> str:
+    """
+    将 ExtendedIndicators（或其 to_dict() 结果）渲染为给 LLM 阅读的 markdown 子版块。
+
+    渲染规则：
+    - 子结构为 None 的整行省略；数值为 None 渲染 "N/A"。
+    - 4 个子版块全空则返回空字符串（不输出空表头）。
+    - report_language 当前仅影响 disclaimer；中文模板优先。
+    """
+    if ext is None:
+        return ""
+
+    # 兼容 dataclass 实例与 dict
+    if hasattr(ext, "to_dict"):
+        data = ext.to_dict()
+    elif isinstance(ext, dict):
+        data = ext
+    else:
+        return ""
+
+    atr = data.get("atr") or None
+    adx = data.get("adx") or None
+    bollinger = data.get("bollinger") or None
+    obv = data.get("obv") or None
+    ma_lt = data.get("ma_long_term") or None
+    donchian = data.get("donchian") or None
+    kdj = data.get("kdj") or None
+    macd_extras = data.get("macd_extras") or None
+    rsi_mp = data.get("rsi_multi_period") or None
+    candle_patterns = data.get("candle_patterns") or []
+
+    sections: List[str] = []
+
+    def _fmt(v: Any, suffix: str = "", precision: int = 2) -> str:
+        if v is None:
+            return "N/A"
+        if isinstance(v, (int, float)):
+            return f"{v:.{precision}f}{suffix}"
+        return str(v)
+
+    # ─── 子版块 ①：波动率与位置 ───
+    rows_1: List[str] = []
+    if atr:
+        rows_1.append(
+            f"| ATR(14) | {_fmt(atr.get('atr_14'), precision=2)} "
+            f"（{_fmt(atr.get('atr_pct'))}%） | "
+            f"{atr.get('interpretation') or '—'} |"
+        )
+        rows_1.append(
+            f"| 建议止损 | {_fmt(atr.get('suggested_stop'), precision=2)} "
+            f"| 现价 - 1.5×ATR（技术止损位） |"
+        )
+        rows_1.append(
+            f"| 建议目标 | {_fmt(atr.get('suggested_target'), precision=2)} "
+            f"| 现价 + 2.5×ATR（风报比 1.67） |"
+        )
+    if bollinger:
+        rows_1.append(
+            f"| 布林位置 %B | {_fmt(bollinger.get('percent_b'), precision=2)} "
+            f"| {bollinger.get('interpretation') or '—'} |"
+        )
+        rows_1.append(
+            f"| 布林带宽 | {_fmt(bollinger.get('bandwidth_pct'))}% "
+            f"（近60日 P{int(bollinger.get('bandwidth_percentile_60d') or 0)}） "
+            f"| 带宽分位反映波动收/放 |"
+        )
+    if rows_1:
+        sections.append(
+            "#### 波动率与位置\n"
+            "| 指标 | 数值 | 解读 |\n"
+            "|------|------|------|\n"
+            + "\n".join(rows_1)
+        )
+
+    # ─── 子版块 ②：趋势真伪与中长期锚点 ───
+    rows_2: List[str] = []
+    if adx:
+        rows_2.append(
+            f"| ADX(14) | {_fmt(adx.get('adx_14'))} "
+            f"| {adx.get('trend_regime', '—')} |"
+        )
+        rows_2.append(
+            f"| +DI / -DI | {_fmt(adx.get('plus_di'))} / {_fmt(adx.get('minus_di'))} "
+            f"| {adx.get('direction', '—')}方向 |"
+        )
+    if ma_lt:
+        ma60_dist = ma_lt.get("distance_to_ma60_pct")
+        ma60_text = "N/A" if ma60_dist is None else f"{ma60_dist:+.2f}%"
+        rows_2.append(
+            f"| 价格 vs MA60 | {ma60_text} | 中期趋势锚点 |"
+        )
+        ma200_val = ma_lt.get("distance_to_ma200_pct")
+        ma200_text = "N/A" if ma200_val is None else f"{ma200_val:+.2f}%"
+        rows_2.append(
+            f"| 价格 vs MA200 | {ma200_text} | 牛熊分界（< 0 偏弱） |"
+        )
+        pos = ma_lt.get("position_52w") or 0
+        rows_2.append(
+            f"| 52周位置 | {_fmt(pos, precision=2)} "
+            f"| 距高点 -{(1 - pos) * 100:.1f}%，"
+            f"距低点 +{pos * 100:.1f}% |"
+        )
+    if rows_2:
+        regime = (adx or {}).get("trend_regime", "")
+        suffix = ""
+        if regime == "震荡市":
+            suffix = "\n\n> ⚠️ ADX < 20 时均线信号失效，请明确按震荡市策略评估。"
+        sections.append(
+            "#### 趋势真伪与中长期锚点\n"
+            "| 指标 | 数值 | 解读 |\n"
+            "|------|------|------|\n"
+            + "\n".join(rows_2)
+            + suffix
+        )
+
+    # ─── 子版块 ③：动量与突破 ───
+    rows_3: List[str] = []
+    if macd_extras:
+        bars = macd_extras.get("bar_recent") or []
+        bars_text = " / ".join(f"{x:+.4f}" for x in bars) if bars else "N/A"
+        rows_3.append(
+            f"| MACD 柱(最近3根) | {bars_text} "
+            f"| {macd_extras.get('bar_trend', '—')} |"
+        )
+    if rsi_mp:
+        rows_3.append(
+            f"| RSI 6/12/24 | {_fmt(rsi_mp.get('rsi_6'), precision=1)} / "
+            f"{_fmt(rsi_mp.get('rsi_12'), precision=1)} / "
+            f"{_fmt(rsi_mp.get('rsi_24'), precision=1)} "
+            f"| {rsi_mp.get('divergence', '—')} |"
+        )
+    if kdj:
+        rows_3.append(
+            f"| KDJ K/D/J | {_fmt(kdj.get('k'), precision=1)} / "
+            f"{_fmt(kdj.get('d'), precision=1)} / "
+            f"{_fmt(kdj.get('j'), precision=1)} "
+            f"| {kdj.get('status', '—')} |"
+        )
+    if donchian:
+        rows_3.append(
+            f"| Donchian 20 | 高 {_fmt(donchian.get('donchian_high_20'), precision=2)} / "
+            f"低 {_fmt(donchian.get('donchian_low_20'), precision=2)} "
+            f"| {donchian.get('breakout_status', '—')} |"
+        )
+    if obv:
+        rows_3.append(
+            f"| OBV 背离 | {obv.get('divergence', '—')} "
+            f"| {obv.get('interpretation') or '—'} |"
+        )
+    if rows_3:
+        sections.append(
+            "#### 动量与突破\n"
+            "| 指标 | 数值 | 解读 |\n"
+            "|------|------|------|\n"
+            + "\n".join(rows_3)
+        )
+
+    # ─── 子版块 ④：蜡烛形态 ───
+    if candle_patterns:
+        sections.append(
+            "#### 蜡烛形态（最近 2 日）\n"
+            + "\n".join(f"- {p}" for p in candle_patterns)
+            + "\n\n> 形态需结合趋势/位置确认；单一形态信号不构成结论。"
+        )
+
+    if not sections:
+        return ""
+
+    return "\n\n".join(sections) + _EXTENDED_DISCLAIMER
+
+
 def _sanitize_trend_analysis_for_prompt(
     trend: Any,
     *,
@@ -3385,6 +3570,10 @@ class GeminiAnalyzer:
                 volume_change_ratio=context.get('volume_change_ratio'),
             )
             consistency_notes = trend.get('prompt_consistency_notes', [])
+            extended_section = _format_extended_indicators_section(
+                trend.get('extended'),
+                report_language=report_language,
+            )
             if use_legacy_default_prompt:
                 bias_warning = "🚨 超过5%，严禁追高！" if trend.get('bias_ma5', 0) > 5 else "✅ 安全范围"
                 prompt += f"""
@@ -3407,6 +3596,8 @@ class GeminiAnalyzer:
 **风险因素**：
 {chr(10).join('- ' + r for r in trend.get('risk_factors', ['无'])) if trend.get('risk_factors') else '- 无'}
 """
+                if extended_section:
+                    prompt += "\n" + extended_section
                 if consistency_notes:
                     prompt += f"""
 
@@ -3439,6 +3630,8 @@ class GeminiAnalyzer:
 **风险因素**：
 {chr(10).join('- ' + r for r in trend.get('risk_factors', ['无'])) if trend.get('risk_factors') else '- 无'}
 """
+                if extended_section:
+                    prompt += "\n" + extended_section
                 if consistency_notes:
                     prompt += f"""
 
@@ -3542,6 +3735,8 @@ class GeminiAnalyzer:
 3. ❓ 量能是否配合（缩量回调/放量突破）？
 4. ❓ 筹码结构是否健康？
 5. ❓ 消息面有无重大利空？（减持、处罚、业绩变脸等）
+6. ❓ 当前 ADX 是否支持顺势交易？震荡市请明确说明波段或观望策略
+7. ❓ 用 ATR 推算的止损/目标位是否落在合理支撑/压力上？是否需调整？
 """
         else:
             prompt += f"""
@@ -3552,6 +3747,8 @@ class GeminiAnalyzer:
 3. ❓ 量能、波动与筹码结构是否支持当前结论？
 4. ❓ 消息面有无重大利空或与技能结论冲突的信息？
 5. ❓ 若结论成立，具体触发条件、止损位、观察点分别是什么？
+6. ❓ 当前 ADX 是否支持顺势交易？震荡市请明确说明波段或观望策略
+7. ❓ 用 ATR 推算的止损/目标位是否落在合理支撑/压力上？是否需调整？
 """
         prompt += f"""
 

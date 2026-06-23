@@ -18,13 +18,17 @@
 
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from enum import Enum
 
 import pandas as pd
 import numpy as np
 
 from src.config import get_config
+from src.technical_indicators import (
+    ExtendedIndicators,
+    compute_extended_indicators,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -131,7 +135,10 @@ class TrendAnalysisResult:
     signal_score: int = 0            # 综合评分 0-100
     signal_reasons: List[str] = field(default_factory=list)
     risk_factors: List[str] = field(default_factory=list)
-    
+
+    # 扩展技术指标（仅供第二阶段 LLM 综合分析使用，不参与 signal_score）
+    extended: Optional[ExtendedIndicators] = None
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             'code': self.code,
@@ -165,6 +172,7 @@ class TrendAnalysisResult:
             'rsi_24': self.rsi_24,
             'rsi_status': self.rsi_status.value,
             'rsi_signal': self.rsi_signal,
+            'extended': None if self.extended is None else self.extended.to_dict(),
         }
 
 
@@ -258,6 +266,13 @@ class StockTrendAnalyzer:
 
         # 7. 生成买入信号
         self._generate_signal(result)
+
+        # 8. 计算扩展技术指标（供第二阶段 LLM 综合分析；不影响 signal_score）
+        try:
+            result.extended = compute_extended_indicators(df)
+        except Exception as exc:  # pragma: no cover - 防御
+            logger.warning(f"{code} 扩展技术指标计算异常: {exc}")
+            result.extended = ExtendedIndicators()
 
         return result
     
